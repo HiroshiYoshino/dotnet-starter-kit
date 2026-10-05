@@ -9,8 +9,6 @@ using FSH.Framework.Shared.Multitenancy;
 using FSH.Framework.Shared.Persistence;
 using FSH.Modules.Catalog.Data;
 using Integration.Tests.Infrastructure;
-using Microsoft.AspNetCore.Mvc.Testing;
-using Microsoft.AspNetCore.TestHost;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
@@ -54,6 +52,9 @@ public sealed class OutboxDedicatedTenantDispatchTests
         {
             Database = targetDatabaseName,
         };
+        var accessor = _factory.Services.GetRequiredService<IMultiTenantContextAccessor<AppTenantInfo>>();
+        var previous = accessor.MultiTenantContext;
+        var eventIds = new List<Guid>();
 
         try
         {
@@ -67,15 +68,16 @@ public sealed class OutboxDedicatedTenantDispatchTests
             await MigrateTenantDatabaseAsync(_factory.Services, targetTenant);
 
             DatabaseRoutingRecorder recorder = new();
-            await using WebApplicationFactory<Program> app = CreateFactory(recorder);
+            await using ServiceProvider app = CreateProvider(defaultConnectionString, recorder);
             DatabaseRoutingIntegrationEvent[] events =
             [
                 NewEvent(sourceTenant.Id),
                 NewEvent(targetTenant.Id),
                 NewEvent(null),
             ];
+            eventIds.AddRange(events.Select(integrationEvent => integrationEvent.Id));
 
-            using (IServiceScope writeScope = app.Services.CreateScope())
+            using (IServiceScope writeScope = app.CreateScope())
             {
                 writeScope.ServiceProvider.GetRequiredService<IMultiTenantContextSetter>()
                     .MultiTenantContext = new MultiTenantContext<AppTenantInfo>(sourceTenant);
@@ -88,7 +90,7 @@ public sealed class OutboxDedicatedTenantDispatchTests
             }
 
             EventingDrainTarget sourceTarget;
-            using (IServiceScope targetProviderScope = app.Services.CreateScope())
+            using (IServiceScope targetProviderScope = app.CreateScope())
             {
                 var targets = await targetProviderScope.ServiceProvider
                     .GetRequiredService<IEventingDrainTargetProvider>()
@@ -97,10 +99,10 @@ public sealed class OutboxDedicatedTenantDispatchTests
                     string.Equals(target.ConnectionString, sourceBuilder.ConnectionString, StringComparison.Ordinal));
             }
 
-            IEventingDrainScope drainScope = app.Services.GetRequiredService<IEventingDrainScope>();
+            IEventingDrainScope drainScope = app.GetRequiredService<IEventingDrainScope>();
             using (drainScope.Begin(sourceTarget))
             {
-                using (IServiceScope dispatchScope = app.Services.CreateScope())
+                using (IServiceScope dispatchScope = app.CreateScope())
                 {
                     EventingDbContext sourceOutbox = dispatchScope.ServiceProvider.GetRequiredService<EventingDbContext>();
                     sourceOutbox.Database.GetDbConnection().Database.ShouldBe(sourceDatabaseName);
@@ -110,7 +112,7 @@ public sealed class OutboxDedicatedTenantDispatchTests
                         .DispatchAsync(CancellationToken.None);
                 }
 
-                using IServiceScope verifyScope = app.Services.CreateScope();
+                using IServiceScope verifyScope = app.CreateScope();
                 EventingDbContext verifyOutbox = verifyScope.ServiceProvider.GetRequiredService<EventingDbContext>();
                 List<OutboxMessage> messages = await verifyOutbox.OutboxMessages
                     .AsNoTracking()
@@ -128,21 +130,30 @@ public sealed class OutboxDedicatedTenantDispatchTests
         }
         finally
         {
+            _factory.Services.GetRequiredService<IMultiTenantContextSetter>().MultiTenantContext = previous;
+            using (IServiceScope scope = _factory.Services.CreateScope())
+            {
+                var store = scope.ServiceProvider.GetRequiredService<IMultiTenantStore<AppTenantInfo>>();
+                await store.RemoveAsync(sourceDatabaseName);
+                await store.RemoveAsync(targetDatabaseName);
+            }
+            await using (var connection = new NpgsqlConnection(defaultConnectionString))
+            {
+                await connection.OpenAsync();
+                await using var command = new NpgsqlCommand("DELETE FROM framework.\"InboxMessages\" WHERE \"Id\" = ANY(@ids)", connection);
+                command.Parameters.AddWithValue("ids", eventIds.ToArray());
+                await command.ExecuteNonQueryAsync();
+            }
             await DropDatabaseAsync(adminBuilder.ConnectionString, targetDatabaseName);
             await DropDatabaseAsync(adminBuilder.ConnectionString, sourceDatabaseName);
         }
     }
 
-    private WebApplicationFactory<Program> CreateFactory(DatabaseRoutingRecorder recorder) =>
-        _factory.WithWebHostBuilder(builder =>
+    private ServiceProvider CreateProvider(string defaultConnection, DatabaseRoutingRecorder recorder) =>
+        DedicatedTenantOutboxRoutingTests.CreateProvider(_factory.Services, defaultConnection, services =>
         {
-            builder.ConfigureTestServices(services =>
-            {
-                services.AddSingleton(recorder);
-                services.AddScoped<
-                    IIntegrationEventHandler<DatabaseRoutingIntegrationEvent>,
-                    DatabaseRoutingHandler>();
-            });
+            services.AddSingleton(recorder);
+            services.AddScoped<IIntegrationEventHandler<DatabaseRoutingIntegrationEvent>, DatabaseRoutingHandler>();
         });
 
     private static async Task AddTenantsAsync(IServiceProvider services, params AppTenantInfo[] tenants)
