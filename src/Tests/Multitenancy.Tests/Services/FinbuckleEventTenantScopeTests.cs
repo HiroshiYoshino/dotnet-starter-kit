@@ -1,7 +1,10 @@
 using Finbuckle.MultiTenant;
 using Finbuckle.MultiTenant.Abstractions;
+using Finbuckle.MultiTenant.Extensions;
+using FSH.Framework.Eventing.Abstractions;
 using FSH.Framework.Shared.Multitenancy;
 using FSH.Modules.Multitenancy.Services;
+using Microsoft.Extensions.DependencyInjection;
 using Shouldly;
 using Xunit;
 
@@ -10,6 +13,32 @@ namespace Multitenancy.Tests.Services;
 public sealed class FinbuckleEventTenantScopeTests
 {
     private readonly StubAccessor _accessor = new();
+
+    [Fact]
+    public void Begin_Should_PreserveDedicatedConnection_When_EventTenantMatchesDrainTenant()
+    {
+        const string connectionString = "Host=localhost;Database=tenant_acme;Username=postgres;Password=postgres";
+        var services = new ServiceCollection();
+        services.AddMultiTenant<AppTenantInfo>();
+        using ServiceProvider provider = services.BuildServiceProvider();
+        var accessor = provider.GetRequiredService<IMultiTenantContextAccessor<AppTenantInfo>>();
+        var setter = provider.GetRequiredService<IMultiTenantContextSetter>();
+        var drainScope = new FinbuckleEventingDrainScope(accessor, setter);
+        var sut = new FinbuckleEventTenantScope(accessor, setter);
+
+        using (drainScope.Begin(new EventingDrainTarget("acme", connectionString)))
+        {
+            accessor.MultiTenantContext.TenantInfo.ShouldNotBeNull();
+            accessor.MultiTenantContext.TenantInfo.ConnectionString.ShouldBe(connectionString);
+
+            using (sut.Begin("acme"))
+            {
+                accessor.MultiTenantContext.TenantInfo.ShouldNotBeNull();
+                accessor.MultiTenantContext.TenantInfo.Id.ShouldBe("acme");
+                accessor.MultiTenantContext.TenantInfo.ConnectionString.ShouldBe(connectionString);
+            }
+        }
+    }
 
     [Fact]
     public void Begin_Should_SetTenantContext_When_TenantIdProvided()
