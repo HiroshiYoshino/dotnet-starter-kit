@@ -61,7 +61,7 @@ public sealed partial class InMemoryEventBus : IEventBus
 
         // Set tenant context BEFORE resolving handlers — MultiTenantDbContext captures TenantInfo at
         // construction, so a late tenant NREs the query filter. This is what makes background publishers work.
-        using (_tenantScope.Begin(@event.TenantId))
+        await _tenantScope.ExecuteAsync(@event.TenantId, async dispatchToken =>
         {
             using var scope = _serviceProvider.CreateScope();
             var provider = scope.ServiceProvider;
@@ -77,9 +77,9 @@ public sealed partial class InMemoryEventBus : IEventBus
 
             foreach (var handler in handlers)
             {
-                await InvokeHandlerAsync(handler, dispatch.HandleMethod, eventType, @event, inbox, ct).ConfigureAwait(false);
+                await InvokeHandlerAsync(handler, dispatch.HandleMethod, eventType, @event, inbox, dispatchToken).ConfigureAwait(false);
             }
-        }
+        }, ct).ConfigureAwait(false);
     }
 
     private static object[] ResolveHandlers(IServiceProvider provider, Type handlerInterfaceType)
