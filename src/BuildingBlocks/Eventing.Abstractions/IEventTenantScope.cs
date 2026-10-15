@@ -24,4 +24,24 @@ public interface IEventTenantScope
     /// ambient context unchanged (global, non-tenant-scoped events).
     /// </summary>
     IDisposable Begin(string? tenantId);
+
+    /// <summary>
+    /// Resolves the dispatch context and runs <paramref name="action"/> within that same
+    /// asynchronous flow. Construct handlers and Inbox inside the action, not beforehand.
+    /// The default bridge uses <see cref="Begin"/>; multitenancy implementations can resolve
+    /// full catalog metadata and define global routing before invoking the action.
+    /// </summary>
+    async Task ExecuteAsync(
+        string? tenantId,
+        Func<CancellationToken, Task> action,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(action);
+        ct.ThrowIfCancellationRequested();
+
+        using (Begin(tenantId))
+        {
+            await action(ct).ConfigureAwait(false);
+        }
+    }
 }

@@ -54,56 +54,47 @@ public sealed class WebhookFanoutHandler<TEvent> : IIntegrationEventHandler<TEve
             return;
         }
 
-        // Install the tenant context for the subscription read — the WebhookDbContext Finbuckle filter needs
-        // it, and the background event pumps (OutboxDispatcher / event bus) carry no HTTP context.
-        var prev = _tenantContextAccessor.MultiTenantContext;
-        try
+        if (!string.Equals(_tenantContextAccessor.MultiTenantContext.TenantInfo?.Id, @event.TenantId, StringComparison.Ordinal))
         {
-            var info = new AppTenantInfo(@event.TenantId, @event.TenantId);
-            ((IMultiTenantContextSetter)_tenantContextAccessor).MultiTenantContext =
-                new MultiTenantContext<AppTenantInfo>(info);
-
-            var eventType = typeof(TEvent).Name;
-
-            // Pull active subscriptions, then match event type in memory: EventsCsv is a CSV blob (no join
-            // table), and there are typically 0–20 subscriptions per tenant so in-memory matching is fine.
-            var subscriptions = await _db.Subscriptions
-                .AsNoTracking()
-                .Where(s => s.IsActive)
-                .ToListAsync(ct)
-                .ConfigureAwait(false);
-
-            var matching = subscriptions.Where(s => s.MatchesEvent(eventType)).ToList();
-            if (matching.Count == 0)
-            {
-                return;
-            }
-
-            var payload = _serializer.Serialize(@event);
-            foreach (var subscription in matching)
-            {
-                try
-                {
-                    await _dispatcher
-                        .EnqueueAsync(@event.TenantId, subscription.Id, eventType, payload, ct)
-                        .ConfigureAwait(false);
-                }
-                catch (Exception ex) when (ex is not OperationCanceledException)
-                {
-                    // One bad subscription must not abort fan-out to others; this catches synchronous
-                    // enqueue-side failures (Hangfire transient errors etc), not delivery (the job retries).
-                    _logger.LogWarning(
-                        ex,
-                        "Failed to enqueue webhook delivery for subscription {SubscriptionId} (tenant {TenantId}, event {EventType})",
-                        subscription.Id,
-                        @event.TenantId,
-                        eventType);
-                }
-            }
+            throw new InvalidOperationException("Webhook fan-out requires the event tenant to be resolved before handler construction.");
         }
-        finally
+
+        var eventType = typeof(TEvent).Name;
+
+        // Pull active subscriptions, then match event type in memory: EventsCsv is a CSV blob (no join
+        // table), and there are typically 0–20 subscriptions per tenant so in-memory matching is fine.
+        var subscriptions = await _db.Subscriptions
+            .AsNoTracking()
+            .Where(s => s.IsActive)
+            .ToListAsync(ct)
+            .ConfigureAwait(false);
+
+        var matching = subscriptions.Where(s => s.MatchesEvent(eventType)).ToList();
+        if (matching.Count == 0)
         {
-            ((IMultiTenantContextSetter)_tenantContextAccessor).MultiTenantContext = prev;
+            return;
+        }
+
+        var payload = _serializer.Serialize(@event);
+        foreach (var subscription in matching)
+        {
+            try
+            {
+                await _dispatcher
+                    .EnqueueAsync(@event.TenantId, subscription.Id, eventType, payload, ct)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // One bad subscription must not abort fan-out to others; this catches synchronous
+                // enqueue-side failures (Hangfire transient errors etc), not delivery (the job retries).
+                _logger.LogWarning(
+                    ex,
+                    "Failed to enqueue webhook delivery for subscription {SubscriptionId} (tenant {TenantId}, event {EventType})",
+                    subscription.Id,
+                    @event.TenantId,
+                    eventType);
+            }
         }
     }
 }

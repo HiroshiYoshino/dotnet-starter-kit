@@ -9,9 +9,8 @@ namespace FSH.Modules.Multitenancy.Services;
 /// Installs an <see cref="AppTenantInfo"/> carrying the tenant's connection string, so an
 /// <c>EventingDbContext</c> built inside the scope routes to that tenant's database.
 ///
-/// Deliberately distinct from <see cref="FinbuckleEventTenantScope"/>, which sets tenant identity
-/// only: that scope wraps handler dispatch, where the row-level tenant filter is what matters.
-/// This one wraps a drain pass, where the target <i>database</i> is what matters.
+/// Distinct from <see cref="FinbuckleEventTenantScope"/>, which resolves the event's consumer
+/// tenant. This scope selects the source database for a drain pass, independently of the consumer.
 /// </summary>
 public sealed class FinbuckleEventingDrainScope : IEventingDrainScope
 {
@@ -30,19 +29,13 @@ public sealed class FinbuckleEventingDrainScope : IEventingDrainScope
     {
         ArgumentNullException.ThrowIfNull(target);
 
-        if (target.TenantId is null && target.ConnectionString is null)
-        {
-            // Default pass: leave the ambient context alone so the context falls through to the
-            // configured default connection.
-            return NoopScope.Instance;
-        }
-
         var previous = _accessor.MultiTenantContext;
 
         // Built by hand rather than via the tenant-shaped constructor: only the id and the
         // connection string matter for routing, and the richer constructor also stamps validity
         // and activation state we have no business inventing here.
-        var info = new AppTenantInfo(target.TenantId!, target.TenantId!)
+        string tenantId = target.TenantId ?? MultitenancyConstants.Root.Id;
+        var info = new AppTenantInfo(tenantId, tenantId)
         {
             ConnectionString = target.ConnectionString ?? string.Empty,
         };
@@ -66,13 +59,4 @@ public sealed class FinbuckleEventingDrainScope : IEventingDrainScope
         public void Dispose() => _setter.MultiTenantContext = _previous;
     }
 
-    private sealed class NoopScope : IDisposable
-    {
-        public static readonly NoopScope Instance = new();
-
-        public void Dispose()
-        {
-            // Nothing to restore — the ambient context was never touched.
-        }
-    }
 }

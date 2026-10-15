@@ -131,6 +131,39 @@ public sealed class WebhookFanoutHandlerTests
     #region Resilience
 
     [Fact]
+    public async Task HandleAsync_Should_PreserveResolvedTenantMetadata_DuringEnqueue()
+    {
+        await using var db = CreateContext();
+        Guid subscriptionId = await SeedSubscriptionAsync(db, [EventType], isActive: true);
+        var tenant = _tenantAccessor.MultiTenantContext.TenantInfo!;
+        tenant.ConnectionString = "dedicated-database";
+        tenant.Plan = "pro";
+        _dispatcher.EnqueueAsync(TenantId, subscriptionId, EventType, Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                _tenantAccessor.MultiTenantContext.TenantInfo.ShouldBeSameAs(tenant);
+                _tenantAccessor.MultiTenantContext.TenantInfo!.ConnectionString.ShouldBe("dedicated-database");
+                return Task.CompletedTask;
+            });
+
+        await CreateHandler(db).HandleAsync(new FakeIntegrationEvent(TenantId));
+
+        await _dispatcher.Received(1).EnqueueAsync(TenantId, subscriptionId, EventType, Arg.Any<string>(), Arg.Any<CancellationToken>());
+        _tenantAccessor.MultiTenantContext.TenantInfo.ShouldBeSameAs(tenant);
+    }
+
+    [Fact]
+    public async Task HandleAsync_Should_RejectMismatchedTenant_WithoutEnqueue()
+    {
+        await using var db = CreateContext();
+        await SeedSubscriptionAsync(db, [EventType], isActive: true);
+
+        await Should.ThrowAsync<InvalidOperationException>(() => CreateHandler(db).HandleAsync(new FakeIntegrationEvent("other")));
+
+        await _dispatcher.DidNotReceiveWithAnyArgs().EnqueueAsync(default!, default, default!, default!, default);
+    }
+
+    [Fact]
     public async Task HandleAsync_Should_Continue_Fanout_When_One_Enqueue_Throws()
     {
         await using var db = CreateContext();

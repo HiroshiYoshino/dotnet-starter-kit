@@ -68,6 +68,7 @@ public sealed class MultitenancyModule : IModule
             Services.TenantInitialPasswordBuffer>();
 
         builder.Services.AddHeroDbContext<TenantDbContext>();
+        builder.Services.AddScoped<IEventTenantResolver, EventTenantResolver>();
 
         // Replace (not Add) the no-op event tenant scope with a Finbuckle-backed one so background
         // event dispatch establishes the tenant before tenant-filtered handler DbContexts are built.

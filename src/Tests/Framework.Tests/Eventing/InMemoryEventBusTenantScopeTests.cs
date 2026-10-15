@@ -1,7 +1,9 @@
 using FSH.Framework.Eventing.Abstractions;
 using FSH.Framework.Eventing.InMemory;
+using FSH.Framework.Eventing.Inbox;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
+using NSubstitute;
 
 namespace Framework.Tests.Eventing;
 
@@ -37,7 +39,88 @@ public sealed class InMemoryEventBusTenantScopeTests
         scope.IsActive.ShouldBeFalse("the scope must be disposed once dispatch completes");
     }
 
+    [Fact]
+    public async Task PublishAsync_Should_ConstructHandlerAndInboxOnlyAfterAsyncLookup()
+    {
+        var lookup = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var recording = new RecordingTenantScope();
+        var tenantScope = new DelayedTenantScope(recording, lookup.Task);
+        int handlerConstructions = 0;
+        int inboxConstructions = 0;
+        var inbox = Substitute.For<IInboxStore>();
+        TenantProbingHandler? handler = null;
+        var services = new ServiceCollection();
+        services.AddScoped<IIntegrationEventHandler<TenantScopedEvent>>(_ =>
+        {
+            recording.IsActive.ShouldBeTrue();
+            recording.BegunWith.ShouldHaveSingleItem().ShouldBe("acme");
+            handlerConstructions++;
+            handler = new TenantProbingHandler(recording);
+            return handler;
+        });
+        services.AddScoped<IInboxStore>(_ =>
+        {
+            recording.IsActive.ShouldBeTrue();
+            inboxConstructions++;
+            return inbox;
+        });
+        using var provider = services.BuildServiceProvider();
+        var bus = new InMemoryEventBus(provider, NullLogger<InMemoryEventBus>.Instance, tenantScope);
+        var integrationEvent = new TenantScopedEvent("acme");
+        using var cancellation = new CancellationTokenSource();
+
+        Task dispatch = bus.PublishAsync(integrationEvent, cancellation.Token);
+        dispatch.IsCompleted.ShouldBeFalse();
+        handlerConstructions.ShouldBe(0);
+        inboxConstructions.ShouldBe(0);
+        lookup.SetResult();
+        await dispatch;
+
+        handlerConstructions.ShouldBe(1);
+        inboxConstructions.ShouldBe(1);
+        handler.ShouldNotBeNull().ScopeWasActiveDuringHandle.ShouldBeTrue();
+        recording.IsActive.ShouldBeFalse();
+        await inbox.Received(1).MarkProcessedAsync(integrationEvent.Id, typeof(TenantProbingHandler).FullName!,
+            "acme", typeof(TenantScopedEvent).AssemblyQualifiedName!, cancellation.Token);
+    }
+
+    [Fact]
+    public async Task PublishAsync_Should_NotConstructConsumers_When_DefaultBridgeIsCancelled()
+    {
+        var recording = new RecordingTenantScope();
+        int constructions = 0;
+        var services = new ServiceCollection();
+        services.AddScoped<IIntegrationEventHandler<TenantScopedEvent>>(_ =>
+        {
+            constructions++;
+            return new TenantProbingHandler(recording);
+        });
+        using var provider = services.BuildServiceProvider();
+        var bus = new InMemoryEventBus(provider, NullLogger<InMemoryEventBus>.Instance, recording);
+        using var cancellation = new CancellationTokenSource();
+        await cancellation.CancelAsync();
+
+        await Should.ThrowAsync<OperationCanceledException>(() => bus.PublishAsync(new TenantScopedEvent("acme"), cancellation.Token));
+
+        constructions.ShouldBe(0);
+        recording.BegunWith.ShouldBeEmpty();
+    }
+
     #region Test doubles
+
+    private sealed class DelayedTenantScope(RecordingTenantScope inner, Task lookup) : IEventTenantScope
+    {
+        public IDisposable Begin(string? tenantId) => throw new InvalidOperationException("Use async dispatch.");
+
+        public async Task ExecuteAsync(string? tenantId, Func<CancellationToken, Task> action, CancellationToken ct = default)
+        {
+            await lookup.WaitAsync(ct).ConfigureAwait(false);
+            using (inner.Begin(tenantId))
+            {
+                await action(ct).ConfigureAwait(false);
+            }
+        }
+    }
 
     private sealed record TenantScopedEvent(string? TenantId) : IIntegrationEvent
     {
@@ -70,10 +153,11 @@ public sealed class InMemoryEventBusTenantScopeTests
     {
         public bool ScopeWasActiveDuringHandle { get; private set; }
 
-        public Task HandleAsync(TenantScopedEvent @event, CancellationToken ct = default)
+        public async Task HandleAsync(TenantScopedEvent @event, CancellationToken ct = default)
         {
+            await Task.Yield();
+            ct.ThrowIfCancellationRequested();
             ScopeWasActiveDuringHandle = scope.IsActive;
-            return Task.CompletedTask;
         }
     }
 
