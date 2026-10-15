@@ -11,7 +11,7 @@
 ## 目次
 
 1. [提示されたシナリオに、何を補う必要があるか](#scope)
-2. [代表シナリオの全体像](#overview)
+2. [代表シナリオの全体像](#overview)（[後続の起動経路](#follow-up-routing)・[派生反映の具体例](#derived-reflection-example)）
 3. [保存境界と実行順序](#transactions)
 4. [層ごとの既存部品と不足](#layers)
 5. [追加する記録と、全体完了の判断](#completion)
@@ -86,10 +86,10 @@ flowchart TD
     subgraph W["job実行・中断再発見"]
         direction LR
         WReuse["再利用: {BB:Jobs} Hangfireの永続job storage<br>既存のworker・job実行機構"]
-        WAdd["追加: module Bの未起動・中断作業の走査<br>進捗に基づく安全な再開"]
+        WAdd["追加: 作業を所有するmoduleの未起動・中断作業の走査<br>進捗に基づく安全な再開"]
     end
     X["外部サービス・object storage<br>安定した操作識別・結果照会"]
-    R["追加: module Bの外部結果と進捗のDB確定<br>{BB:Eventing} 完了通知のOutboxも同時保存"]
+    R["追加: 作業を所有するmoduleの外部結果と進捗のDB確定<br>{BB:Eventing} 完了通知のOutboxも同時保存"]
     subgraph C["完了通知の配送・受信"]
         direction LR
         CReuse["再利用: {BB:Eventing} Outbox・EventBus・Inbox<br>既存の配送・受信経路"]
@@ -105,8 +105,9 @@ flowchart TD
     end
     subgraph P["cache・URL・通知の派生反映"]
         direction LR
-        PReuse["再利用: {BB:Caching} cache無効化<br>{Mod:Catalog} {Mod:Identity} URL反映<br>{Mod:Notifications} {BB:Web} 通知機構"]
-        PReinforce["補強: {BB:Caching} {Mod:Catalog} {Mod:Identity}<br>{Mod:Notifications} {BB:Web}<br>正本・版との照合と再同期<br>反映失敗の検出・滞留からの回復"]
+        PReuse["再利用: {BB:Caching} cache操作<br>{BB:Web} リアルタイム通知"]
+        PModuleReuse["再利用: 更新対象moduleの反映handler<br>通知データを扱う場合は{Mod:Notifications}<br>URL反映の具体例は下図"]
+        PReinforce["補強: 更新対象moduleの反映処理<br>正本・版との照合と再同期<br>反映失敗の検出・滞留からの回復"]
     end
 
     U --> API
@@ -115,7 +116,7 @@ flowchart TD
     D --> T
     T --> B
     B --> I
-    B --> W
+    B -->|"本例: 同時保存した作業記録の走査で起動"| W
     W --> X
     X --> R
     R --> C
@@ -123,14 +124,16 @@ flowchart TD
     O --> Q
     A -.->|"本体の耐久確定後に受理を応答"| Q
     A -.->|"同時確定した監査用起動記録から"| AU
+    A -.->|"Aからの起動も可能: 経路は下図で選択"| W
+    A -.->|"Aの更新に伴う派生反映もある: 経路は下図"| P
     R -.->|"必要なら同じ方式で"| AU
-    B -.-> P
+    B -.->|"直接呼出し・event経由等: 経路は下図"| P
 
     classDef reuse fill:#e8f1fb,stroke:#356aa0,color:#172b4d
     classDef reinforcement fill:#fff4d6,stroke:#ad7010,color:#563b0f
     classDef addition fill:#e9f5e9,stroke:#397a3c,color:#173b1a
     classDef neutral fill:#f1f5f9,stroke:#94a3b8,color:#1e293b
-    class API,AReuse,BReuse,WReuse,CReuse,AUReuse,PReuse reuse
+    class API,AReuse,BReuse,WReuse,CReuse,AUReuse,PReuse,PModuleReuse reuse
     class D,T,I,CReinforce,AUReinforce,PReinforce reinforcement
     class AAdd,BAdd,WAdd,R,O,Q,AUAdd addition
     class U,X neutral
@@ -144,9 +147,101 @@ flowchart TD
 
 詳細枠の横並びは実行順序や並列実行を示すものではありません。A・Bの外枠はDBの保存境界ですが、それ以外の外枠は処理のまとまりであり、外部IOまでを一つのtransactionに含める意味ではありません。
 
-図は一本の主経路です。分岐があれば、B以降を必須の後続ごとに持ちます。完了通知も、元の要求と同じ配送・受信の安全策を通します。図のInbox記録はBのDB transactionと自動的に一体になるものではありません。
+主線ではBが外部作業を持つ例を示しています。Aからの点線は別の構成も選べることを示し、一つの操作で両方の経路を必ず実行するという意味ではありません。jobと派生反映の起点は、**AかBかではなく、正本の更新と必要な後続処理を所有するmodule**によって決まります。これらの矢印は業務上の依存関係であり、transactionの中から直接起動することや、Outboxの自動実行を示すものではありません。
+
+分岐があれば、B以降を必須の後続ごとに持ちます。完了通知も、元の要求と同じ配送・受信の安全策を通します。図のInbox記録はBのDB transactionと自動的に一体になるものではありません。
 
 **HTTPで要求を受理したこと、本体DBが保存されたこと、eventが配送されたこと、すべての必須業務が完了したことは、別の到達点です。**
+
+<a id="follow-up-routing"></a>
+
+### 後続処理の起点と起動経路
+
+全体図の「job実行」と「派生反映」への矢印は、以下のような経路に展開します。**更新元はmodule A・Bのどちらでもよく、後続処理ごとに方式を選びます。** 同じ操作でも、任意の画面通知は直接呼び、必須の後続更新はOutboxで渡す、という組合せがあり得ます。
+
+次の図は起動経路の比較であり、四方式を順番に実行する図ではありません。受信側のDB更新・tenant解決・重複防止等は全体図で示したものを適用し、ここでは省略しています。
+
+```mermaid
+sequenceDiagram
+    participant M as 更新元module AまたはB
+    participant DB as 更新元のDB
+    participant D as {BB:Eventing} Dispatcher
+    participant H as EventBus経由の受信handler
+    participant S as 所有moduleの走査worker
+    participant J as {BB:Jobs} Hangfire
+    participant F as 派生反映またはjob本体
+
+    alt 方式1: 保存後に直接実行
+        M->>DB: 業務更新を確定
+        M->>F: cache無効化やリアルタイム通知を直接呼ぶ
+    else 方式2: Outbox経由で派生反映
+        M->>DB: 同じtransactionで業務更新とOutboxを確定
+        D->>DB: 保存済みeventを取得
+        D->>H: EventBus経由で配送
+        H->>F: 派生反映を実行
+    else 方式3: 作業記録を走査してjob起動
+        M->>DB: 同じtransactionで業務更新と作業記録を確定
+        S->>DB: 未起動・中断の作業を再発見
+        S->>J: 同じ作業としてenqueue
+        J->>F: jobを実行
+    else 方式4: Outbox経由でjob起動
+        M->>DB: 同じtransactionで業務更新とOutboxを確定
+        D->>DB: 保存済みeventを取得
+        D->>H: EventBus経由で配送
+        H->>J: 同じ作業としてenqueue
+        J->>F: jobを実行
+    end
+```
+
+| 方式 | Outbox・eventは間に入るか | 失敗・再実行で補うこと |
+|---|---|---|
+| 1. 保存後に直接実行 | 入らない。 | commit後・呼出し前の停止は別途再同期等で回復する。必須作業を失ってよい理由にはしない。 |
+| 2. Outboxで派生反映 | 入る。Outbox → Dispatcher → EventBus → handler。 | 業務とOutboxの同時確定、受信側の重複・順序制御、未反映の回復。 |
+| 3. 作業記録を走査 | Outboxは必須でない。作業記録が耐久的な引継ぎを担う。 | 未起動の再発見、担当権、重複enqueueを許容するjob、手順効果と進捗の整合。 |
+| 4. Outboxでjob起動 | 入る。ただしeventの受信先はjobを起動するhandler。 | enqueue後・処理済み記録前に止まるとjobが重複し得る。Inboxだけに頼らずjob側も同じ操作へ収束させる。 |
+
+**Outboxは起動要求の耐久的な引継ぎ、Hangfireはenqueueされたjobの実行を担い、代替関係ではありません。** 全体図のBからjobへの主線は方式3を選んだ目標例です。方式4を選ぶなら、BのOutbox → 配送 → 起動handler → Hangfireという経路に置き換えます。派生反映の矢印は方式1・2等を省略しており、直接実行に固定したものではありません。
+
+現状の実装がすべて上記の安全策を満たすわけではありません。例えば、[初期構築][provision]は進捗保存後に直接enqueueしており、方式3のような未起動回復が完成済みという意味ではありません。[ChatのSignalR通知][chat-send]は保存後の直接呼出しです。また、Outboxに保存せずEventBusへ直接publishする経路もあり、それは方式2の耐久引継ぎとは区別します。
+
+<a id="derived-reflection-example"></a>
+
+### 派生反映の具体例: Filesの変更をCatalog・Identityへ反映する
+
+全体図の**「更新対象moduleの反映handler」**の実装例として、Filesでファイルの保存先が変わったとき、他moduleが保持するURL参照を更新する経路を取り上げます。
+
+Filesはファイルの保存先を管理しますが、そのファイルを利用する商品画像やユーザーavatarのURLは、それぞれの業務moduleのDBにも保持されています。保存先の変更に追随するため、Catalogには`ProductImage.Url`を、Identityには`FshUser.ImageUrl`を更新するhandlerがあります。
+
+この例では、**配送・cache操作等の共通機構と、反映対象の業務データを所有するmoduleを区別します。** CatalogとIdentityは後者です。Identityは認証・認可も提供しますが、ここではavatar参照の所有者として扱います。各部品の役割は次のとおりです。
+
+| 種類 | 対象 | この説明での役割 |
+|---|---|---|
+| 共通の技術部品 | `{BB:Caching}` | cacheの取得・保存・無効化等。どの正本の変更で何を無効化するかは業務側が決める。 |
+| 共通の技術部品 | `{BB:Web}` | SignalR等によるリアルタイム通知。通知先・内容・業務完了の意味は呼出元が決める。 |
+| 通知データの所有module | `{Mod:Notifications}` | 通知record等を扱う場合の反映先。すべてのcache更新・SignalR送信がこのmoduleを通るわけではない。 |
+| 業務データの反映先の例 | `{Mod:Catalog}` | ファイルを参照する商品画像のURLを更新する。 |
+| 業務データの反映先の例 | `{Mod:Identity}` | ファイルを参照するユーザーavatarのURLを更新する。 |
+
+次は**現在あるURL反映経路の具体例**です。青は既存部品を示すもので、tenant・順序・配送等の保証がすべて完成しているという意味ではありません。
+
+```mermaid
+flowchart TD
+    F["再利用: {Mod:Files}<br>FileStorageRelocator<br>FileAsset更新とOutbox保存"]
+    E["再利用: {BB:Eventing}<br>Dispatcher・EventBus・Inbox"]
+    C["再利用: {Mod:Catalog}<br>FileStorageKeyChangedProductImageHandler<br>ProductImage.Urlを更新"]
+    I["再利用: {Mod:Identity}<br>FileStorageKeyChangedAvatarHandler<br>FshUser.ImageUrlを更新"]
+
+    F -->|"FileStorageKeyChangedIntegrationEvent"| E
+    E -->|"handler内でOwnerTypeがProductの場合"| C
+    E -->|"handler内でOwnerTypeがUserの場合"| I
+
+    classDef reuse fill:#e8f1fb,stroke:#356aa0,color:#172b4d
+    class F,E,C,I reuse
+```
+
+EventBusがOwnerTypeで振り分けるという意味ではなく、登録されたhandlerが内部で対象種別を判定します。CatalogはFileAsset IDに対応する商品画像を、Identityは対象ユーザーのavatarを確認します。両方の更新が常に発生するわけではなく、ここで`Caching`や`Notifications`を必ず経由するわけでもありません。[Catalogのhandler][product-url]・[Identityのhandler][avatar-url]
+
+この例では、全体図の**「更新対象moduleの反映handler」**にCatalog・IdentityのURL更新handlerが対応します。別の業務moduleでも、同じように自分が所有する派生データの更新を担当し、必要に応じてCachingやWeb等の共通部品を利用します。
 
 <a id="transactions"></a>
 
@@ -211,28 +306,36 @@ sequenceDiagram
 
 ## 4. 層ごとの既存部品と不足
 
+修正・追加の対象を、次の三つの列に分けます。**共通部品を直す作業と、それを各機能で正しく使う作業は別であり、同じ行の複数列が必要になる場合があります。**
+
+- **Module横断の共通部品**: BuildingBlocksや、複数moduleから利用する共通機能・契約の変更。Auditingの共通保存経路もここに含め、実装場所を併記します。
+- **Module内の共通部品**: 一つのmodule内で、複数の入口・handler・jobが共有するservice、記録・回復機構等の変更。
+- **個別機能の実装・適用**: handler等での既存部品の使い方、業務ルール・保存境界・成功条件、機能固有のrecordやeventの追加。単なる呼出方法の修正だけに限りません。
+
+`—`は、本書の初期案ではその区分の共通部品変更を要求しないことを示します。「既存実装のままで、その機能の保証が成立している」という意味ではありません。「必要時」「共通化候補」は条件付きの案です。また、特定業務のeventとconsumerを一緒に直す場合は、複数moduleへ影響しても、汎用的な共通部品の改修とは区別して個別機能の列に記載します。
+
 ### 4.1. 入口と、最初のDB保存
 
-| 処理層 | 現在ある機能部品 | このシナリオで必要になる修正・追加 |
-|---|---|---|
-| UI・API入口 | ReactのAPI呼出し・Query、認証・permission、Mediator command、validator。 | 必須後続がある操作では受理と全体完了を分ける。再送時の操作ID維持、認可付き結果照会、必要なら進捗表示を追加する。 |
-| HTTP再送対策 | `Web\Idempotency\IdempotencyEndpointFilter.cs`の応答cache・予約。 | 業務操作IDと入力同一性をDBで管理する。commit後・cache保存前の停止をcacheだけでは扱えない。同じIDで異なる入力は拒否する。 |
-| 業務判断 | domainの検査、validator、一部の一意制約・状態ガード。 | 正しい期間・計算・対象状態を決め、異なる操作の加算や集合条件を保護する。transactionだけで読取競合が解消するとはしない。 |
-| 複数更新の保存 | EF transaction、`Persistence\ScopedDbConnectionProvider.cs`、`AmbientDbTransactionRegistry.cs`。 | handler/service側で境界を定め、内部保存するmanagerも含め全結果を確認する。同じcontext・接続への参加を実証する。 |
-| 後続の起動記録 | `Eventing\Outbox\EfCoreOutboxStore.cs`の保存・transaction参加。 | 業務更新と同時確定するよう呼出元を修正する。必要なら操作ID・手順ID・版をeventの公開契約へ加える。直接publishやローカルdomain eventだけに必須作業を任せない。 |
+| 処理層 | 現在ある機能部品 | 共通部品の修正・追加（Module横断） | 共通部品の修正・追加（Module内） | 個別機能の実装・適用 |
+|---|---|---|---|---|
+| UI・API入口 | ReactのAPI呼出し・Query、認証・permission、Mediator command、validator。 | —。共通の操作受付frameworkの新設は前提にしない。 | —。進捗照会等を複数機能で共用できる場合だけ、module内serviceへの集約を検討する。 | 必須後続がある操作では受理と全体完了を分ける。再送時の操作ID維持、認可付き結果照会、必要なら進捗表示を追加する。 |
+| HTTP再送対策 | `Web\Idempotency\IdempotencyEndpointFilter.cs`の応答cache・予約。 | 必要時: filterの入力fingerprint照合・予約延長等を別課題として改修する。業務の一回効果は、この改修の有無に依存させない。 | 共通化候補: 同じmoduleの複数操作で契約が一致する場合の操作記録・照会service。初期案では汎用化を必須にしない。 | 業務操作IDと入力同一性をDBで管理する。同じIDで異なる入力を拒否する。commit後・cache保存前の停止は、操作結果の照会等で扱う。 |
+| 業務判断 | domainの検査、validator、一部の一意制約・状態ガード。 | —。汎用の検査・ロック部品の新設は前提にしない。 | 同じ不変条件を複数の更新経路が扱う場合は、domain/serviceに判定と更新を集約する。 | 正しい期間・計算・対象状態を決め、異なる操作の加算や集合条件を保護する。transactionだけで読取競合が解消するとはしない。 |
+| 複数更新の保存 | EF transaction、`Persistence\ScopedDbConnectionProvider.cs`、`AmbientDbTransactionRegistry.cs`。 | —。既存の接続共有・transaction参加を再利用し、新しい汎用UnitOfWorkは追加しない。 | 同じ更新を複数の入口が使う場合は、そのmoduleのserviceで保存境界を共有する。共通transaction wrapperの新設自体は必須でない。 | handler/service側でtransactionを開始し、内部保存するmanagerも含め全結果を確認する。同じcontext・接続への参加と途中失敗時のrollbackを実証する。 |
+| 後続の起動記録 | `Eventing\Outbox\EfCoreOutboxStore.cs`の保存・transaction参加。 | —。保存側は既存の参加機構を使う。配送・担当権の共通改修は4.2で扱う。 | 同じ業務更新を複数経路が呼ぶ場合は、業務保存と起動記録を一体にするmodule serviceへ集約する。 | 業務更新とOutboxを同時確定するよう呼出元を修正する。必要なら操作ID・手順ID・版をその業務のevent契約とconsumerへ追加する。直接publishやローカルdomain eventだけに必須作業を任せない。 |
 
 BuildingBlocksのパスは`src\BuildingBlocks\`からの相対パスです。操作IDはcorrelation IDとは分けます。入力同一性の判定にも秘密値を平文保存せず、単純なhashを残せばどんな入力でも安全とする設計にはしません。
 
 ### 4.2. 配送と、受信moduleのDB保存
 
-| 処理層 | 現在ある機能部品 | このシナリオで必要になる修正・追加 |
-|---|---|---|
-| 送信元DBの選択 | `IEventingDrainScope`、Multitenancyの`FinbuckleEventingDrainScope`。 | 既存能力を再利用し、どのDBのOutboxをdrainするかを維持する。consumerの接続選択とは別に検証する。 |
-| 配送・担当権 | `OutboxDispatcher`、`IOutboxStore`、`EfCoreOutboxStore`、`OutboxMessage`。claim、有限retry、隔離・redriveのstore API。 | claimごとのtokenと条件付き結果更新を追加し、旧workerによる上書きを防ぐ。長時間処理ならlease更新も判断する。隔離後の警告・認可された再投入を運用へつなぐ。 |
-| consumerの作用先 | `Eventing.Abstractions\IEventTenantScope.cs`、`InMemoryEventBus`、`FinbuckleEventTenantScope`。 | 同期`Begin`によるIDのみの設定から、完全なtenant metadataを非同期解決して処理する契約へ補強する。handler・Inbox・DbContextの構築前に行う。未知tenantを既定DBへ流さない。 |
-| 配送の処理済み判定 | `Inbox\EfCoreInboxStore.cs`、`IInboxStore`。handler後のmarker保存。 | 包括的な`DbUpdateException`抑制をやめる。現在のInboxだけで業務効果とmarkerの同時確定が提供されているとは扱わない。[現状の呼出順][event-bus]・[Inbox保存][inbox-store] |
-| 受信業務の一回効果 | 受信handlerとmodule DbContext。業務によっては既存の一意キーや条件付き更新。 | 初期案では、既存業務キーまたはmodule所有の`AppliedIntegrationEvent`等を使い、業務効果と同時保存する。同義eventが別IDで来る場合は業務操作IDも使う。 |
-| 順序・分岐・次の起動 | 個別handlerでの状態確認・更新。URL置換等にも個別の判定がある。 | 業務の版・状態遷移で古いeventを判定する。必要な次のevent・job起動記録も、受信業務と同時に確定する。複数handlerが一つの共通transactionで動くとはしない。 |
+| 処理層 | 現在ある機能部品 | 共通部品の修正・追加（Module横断） | 共通部品の修正・追加（Module内） | 個別機能の実装・適用 |
+|---|---|---|---|---|
+| 送信元DBの選択 | `IEventingDrainScope`、Multitenancyの`FinbuckleEventingDrainScope`。 | —。既存の送信元DB選択を維持し、consumer側のtenant契約とは分ける。 | —。 | 各構成でどのDBのOutboxへ保存・drainするかを確認する。consumerの接続選択とは別に検証する。 |
+| 配送・担当権 | `OutboxDispatcher`、`IOutboxStore`、`EfCoreOutboxStore`、`OutboxMessage`。claim、有限retry、隔離・redriveのstore API。 | Eventingのclaimごとのtokenと条件付き結果更新を追加し、旧workerの上書きを防ぐ。必要ならlease更新も追加する。隔離・再投入の公開操作と観測を整備する。 | —。Eventingの担当権処理を各moduleへ重複実装しない。 | 長時間処理・外部二重効果への対策を選ぶ。再投入で業務効果が増えないことを確認し、隔離後の警告・対応責任を決める。 |
+| consumerの作用先 | `Eventing.Abstractions\IEventTenantScope.cs`、`InMemoryEventBus`、`FinbuckleEventTenantScope`。 | Eventingの同期`Begin`契約とMultitenancyのadapterを、完全なtenant metadataを非同期解決する契約へ補強する。handler・Inbox・DbContext構築前に適用し、未知tenantを既定DBへ流さない。 | —。共通dispatch契約の責務として扱い、各handlerに同じtenant解決を重ねない。 | 共有DB・専用DB・global eventの対象条件を確認し、各consumerが正しい接続とtenantで動くことを検証する。 |
+| 配送の処理済み判定 | `Inbox\EfCoreInboxStore.cs`、`IInboxStore`。handler後のmarker保存。 | `EfCoreInboxStore`の包括的な`DbUpdateException`抑制をやめ、対象の一意制約違反だけを重複と判定する。[現状の呼出順][event-bus]・[Inbox保存][inbox-store] | —。module側の業務重複防止は次の行で分けて扱う。 | 現在のInboxだけで業務効果とmarkerが同時確定するとは扱わない。marker保存前の停止・再配送で業務効果が増えないことを確認する。 |
+| 受信業務の一回効果 | 受信handlerとmodule DbContext。業務によっては既存の一意キーや条件付き更新。 | —。初期案では、全handlerを包む共通の受信transaction部品を追加しない。 | 複数consumerで必要なら、module所有の`AppliedIntegrationEvent`等と保存処理を共用する。既存の業務一意キーで足りる場合は新設しない。 | 重複防止記録または業務一意キーと業務効果を、同じmodule DBのtransactionで確定する。同義eventが別IDで来る場合は業務操作IDも使う。 |
+| 順序・分岐・次の起動 | 個別handlerでの状態確認・更新。URL置換等にも個別の判定がある。 | —。汎用の全event順序制御・分岐管理engineの新設は前提にしない。 | 同じ状態を複数handlerが更新する場合は、版判定・状態遷移をdomain/serviceに集約する。 | 古いeventを判定し、必要な次のevent・job起動記録を受信業務と同時確定する。複数handlerが一つの共通transactionで動くとはしない。 |
 
 担当権tokenの追加候補は、`Eventing\Outbox\`の上記4ファイルとEF configurationです。schema変更は`src\Host\FSH.Starter.Migrations.PostgreSQL\Eventing\`で扱い、既存のDbMigrator・`EventingDbInitializer`経路で必要なDBへ適用します。
 
@@ -240,14 +343,14 @@ consumerのtenant契約変更はBuildingBlocksだけでは閉じません。`src
 
 ### 4.3. DBの外へ進んだ後と、全体の回復
 
-| 処理層 | 現在ある機能部品 | このシナリオで必要になる修正・追加 |
-|---|---|---|
-| jobの起動・実行 | Hangfireの永続storageとworker。Multitenancyの既存provisioning・step記録。 | DB保存後・enqueue前の停止を埋める耐久起動と未起動の走査。job重複を許容する手順実装。既存provisioningは拡張し、別の汎用workflow表を重ねない。[現状][provision] |
-| 外部IO | storage service、HTTP resilience、メール・Webhookの個別実装。Filesの移動・清掃処理。 | 安定した外部操作キー、結果照会、対象keyと進捗の保持、再実行・補償・孤児回収。相手が非対応なら保証外と要対応を明示する。 |
-| 全体進捗・完了集約 | 一部の業務進捗や状態照会。全操作を覆う汎用の完了管理部品は確認していない。 | 必要な業務に、操作・必須手順の状態、完了通知または正本照会、未完了の再発見を追加する。これがOutbox配送状態と業務完了をつなぐ部分になる。 |
-| 監査 | Auditing moduleの`ChannelAuditPublisher`、`AuditBackgroundWorker`、`SqlAuditSink`、`FileAuditDlqSink`。 | sinkの重複許容、tenant別の部分成功後の再投入、退避失敗の可視化。必須証跡は耐久受理経路を選び、試行と最終commitを区別する。[現状][audit-sink] |
-| 派生状態・表示 | cache無効化、quota、SignalR、URL反映等。 | 正本・版・許容遅延を決め、反映失敗を検出して再同期する。通知送信済みを、利用者が正しい値を取得できることと同一視しない。 |
-| 回復・保持・運用 | log・metrics、Outboxの隔離・再投入API、個別保守job。 | 認可付きの照会・再開・補償、滞留警告、担当と期限、重複記録の保持、復元後の照合を定める。旧event形式の読取・移行・隔離方針も必要。 |
+| 処理層 | 現在ある機能部品 | 共通部品の修正・追加（Module横断） | 共通部品の修正・追加（Module内） | 個別機能の実装・適用 |
+|---|---|---|---|---|
+| jobの起動・実行 | Hangfireの永続storageとworker。Multitenancyの既存provisioning・step記録。 | —。既存Jobs基盤を使い、新しいjob engineは追加しない。Outboxで起動する場合は4.2の補強を使う。 | 所有moduleの耐久作業record・未起動走査・回復jobを整備する。Multitenancyでは既存provisioning・step記録とserviceを拡張し、別の汎用workflow表を重ねない。[現状][provision] | 業務更新と起動記録を同時確定する。各手順を重複jobでも安全にし、効果と進捗のずれを回復する。初期構築の秘密入力等も再開契約に含める。 |
+| 外部IO | storage service、HTTP resilience、メール・Webhookの個別実装。Filesの移動・清掃処理。 | この案では一律の新規部品は追加しない。外部結果の「不存在・成功・確認不能」を既存公開契約で区別できない場合は、該当Storage等の共通契約改修を別途設計する。 | 共通化候補: 同じmoduleの複数機能が使う外部作業・清掃record、worker、結果照会adapter。対象keyと進捗を保持する。 | 安定した外部操作キー、結果照会、再実行・補償・孤児回収を設計する。相手が非対応なら保証外と要対応を明示する。 |
+| 全体進捗・完了集約 | 一部の業務進捗や状態照会。全操作を覆う汎用の完了管理部品は確認していない。 | —。全module共通の操作DbContext・Saga engineは初期案に含めない。 | 共通化候補: 所有moduleの進捗照会・未完了走査・通知集約service。既存の業務進捗を優先して拡張する。 | 必要な操作・必須手順の状態、完了通知または正本照会を追加する。どの手順の成立で全体完了かを定め、Outbox配送済みだけで完了にしない。 |
+| 監査 | Auditing moduleの`ChannelAuditPublisher`、`AuditBackgroundWorker`、`SqlAuditSink`、`FileAuditDlqSink`。 | 実装先はAuditing。sinkの重複許容、tenant別の部分成功後の再投入、退避失敗の可視化を改修する。必要時は耐久受理契約・経路と試行／最終commitの区別を整える。[現状][audit-sink] | 必須監査を複数の更新経路が使う場合は、発行元module内で監査用起動記録の保存を共用する。Auditingのsink処理を各moduleに複製しない。 | 必須証跡の対象と受理点を決め、業務transactionへ起動記録を参加させる。任意診断との違い、記録不能時の応答・完了条件を決める。 |
+| 派生状態・表示 | cache無効化、quota、SignalR、URL反映等。 | —。既存Caching・Web等を再利用する。汎用の自動再同期機構があるとは扱わない。 | 同じ派生データを複数経路で更新する場合は、そのmoduleの反映・再計算serviceや照合jobを共用する。 | 正本・版・許容遅延を決め、反映handlerで失敗を検出し、再同期する。通知送信済みを、利用者が正しい値を取得できることと同一視しない。 |
+| 回復・保持・運用 | log・metrics、Outboxの隔離・再投入API、個別保守job。 | Eventing等の共通基盤では、隔離・再投入の認可付き公開操作と滞留の観測を整える。配送・担当権の行と同じ作業であり、別の基盤を重ねない。 | 所有moduleの照会・再開・補償・保持処理と未完了走査を共用する。 | 操作ごとの再投入可否、旧eventの読取・移行・隔離、重複記録の保持、復元後の照合を定める。警告先・担当・期限を運用として決める。 |
 
 HTTP・job・Outboxのretryを重ねると、外部呼出回数が増えます。PostgreSQLの共通設定ではDB実行retryは有効化されておらず、機構の存在だけで全IOを再試行すると考えません。再試行対象・上限・結果不明の扱いを、層をまたいで決めます。
 
@@ -391,3 +494,4 @@ stateDiagram-v2
 [inbox-store]: https://github.com/HiroshiYoshino/dotnet-starter-kit/blob/a967537526f3b769c7d268da3ed2a6920af65ce9/src/BuildingBlocks/Eventing/Inbox/EfCoreInboxStore.cs#L23-L64
 [provision]: https://github.com/HiroshiYoshino/dotnet-starter-kit/blob/a967537526f3b769c7d268da3ed2a6920af65ce9/src/Modules/Multitenancy/Modules.Multitenancy/Provisioning/TenantProvisioningService.cs#L35-L174
 [audit-sink]: https://github.com/HiroshiYoshino/dotnet-starter-kit/blob/a967537526f3b769c7d268da3ed2a6920af65ce9/src/Modules/Auditing/Modules.Auditing/Persistence/SqlAuditSink.cs#L23-L71
+[chat-send]: https://github.com/HiroshiYoshino/dotnet-starter-kit/blob/a967537526f3b769c7d268da3ed2a6920af65ce9/src/Modules/Chat/Modules.Chat/Features/v1/Messages/SendMessage/SendMessageCommandHandler.cs#L79-L100
